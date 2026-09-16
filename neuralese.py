@@ -568,6 +568,140 @@ def hidden_recurrent_answer(
 
 
 @torch.inference_mode()
+def interleaved_recurrent_answer(
+    model,
+    tokenizer,
+    prompt: str,
+    hidden_steps_per_token: int,
+    max_thinking_tokens: int,
+    max_new_tokens: int,
+    output_temperature: float,
+    output_top_p: float,
+    seed: int,
+    use_thinking_scaffold: bool = True,
+    messages: Sequence[dict] | None = None,
+    on_text: Callable[[str], None] | None = None,
+    on_interleaved_token: Callable[[int, str, int, float], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> tuple[str, int, int, bool]:
+    """Alternate greedy real thinking tokens with recurrent hidden positions.
+
+    Real tokens are kept separate from the hidden positions.  In particular,
+    the closing marker is always appended as one contiguous, real-token anchor
+    after this phase, even when the generated thinking tokens naturally contain
+    ``THINK_END``.  This guarantees an on-manifold transition to visible answer
+    decoding: natural marker pieces can otherwise have hidden positions between
+    them.  If ``should_stop`` interrupts a gap, the selected token is still
+    reported and the callback/counts describe the partial gap; this is the
+    intentional exception to the usual ``N * (T - 1)`` hidden-position count.
+    """
+    if hidden_steps_per_token < 0:
+        raise ValueError("hidden_steps_per_token must be non-negative")
+    if max_thinking_tokens < 1:
+        raise ValueError("max_thinking_tokens must be positive")
+
+    # Prime with the ordinary CausalLM wrapper so the prompt/scaffold cache and
+    # next-token logits have exactly the same shape and placement as the other
+    # recurrence modes.  Each subsequent position uses the efficient text-model
+    # helper, which also provides the final normalized hidden state for recurrence.
+    cache, logits = prime_thinking_context(
+        model, tokenizer, prompt, use_thinking_scaffold, messages=messages
+    )
+    thinking_ids: list[int] = []
+    completed_thinking_tokens = 0
+    completed_hidden_steps = 0
+    thinking_end_detected = False
+    eos_ids = _generation_eos_ids(model)
+    final_hidden = None
+
+    for _ in range(max_thinking_tokens):
+        if should_stop is not None and should_stop():
+            break
+
+        # Thinking selection is deliberately greedy.  Sampling controls apply
+        # only to the visible answer phase below.
+        token_id = choose_token(logits, temperature=0.0, top_p=1.0, generator=None)
+        if token_id in eos_ids:
+            # EOS is a phase terminator, not a real thinking position: do not
+            # feed it through the model and do not count or report it.
+            break
+
+        token = torch.tensor([[token_id]], device=model.device)
+        cache, logits, final_hidden = _forward_hidden_recurrence(
+            model,
+            input_ids=token,
+            past_key_values=cache,
+        )
+        completed_thinking_tokens += 1
+        thinking_ids.append(token_id)
+
+        decoded_thinking = tokenizer.decode(
+            thinking_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        thinking_end_detected = THINK_END in decoded_thinking
+        terminal_token = (
+            thinking_end_detected
+            or completed_thinking_tokens >= max_thinking_tokens
+        )
+
+        if not terminal_token:
+            # Hidden positions exist only between real thinking tokens.  If a
+            # stop arrives in this gap, report the completed token with the
+            # state reached by the completed portion of its gap and preserve
+            # both counters; no next real token is attempted.
+            gap_interrupted = False
+            for _ in range(hidden_steps_per_token):
+                if should_stop is not None and should_stop():
+                    gap_interrupted = True
+                    break
+                cache, logits, final_hidden = _forward_hidden_recurrence(
+                    model,
+                    inputs_embeds=final_hidden.to(model.device),
+                    past_key_values=cache,
+                )
+                completed_hidden_steps += 1
+            if gap_interrupted:
+                terminal_token = True
+
+        final_rms = final_hidden.float().square().mean().sqrt().item()
+        if on_interleaved_token is not None:
+            on_interleaved_token(
+                completed_thinking_tokens,
+                tokenizer.decode(
+                    [token_id],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                ),
+                completed_hidden_steps,
+                final_rms,
+            )
+        if thinking_end_detected or terminal_token:
+            break
+
+    cache, logits = append_visible_anchor(model, tokenizer, cache, logits)
+    answer = decode_visible_answer(
+        model,
+        tokenizer,
+        cache,
+        logits,
+        max_new_tokens,
+        output_temperature,
+        output_top_p,
+        seed,
+        on_text=on_text,
+        should_stop=should_stop,
+    )
+    return (
+        answer,
+        completed_thinking_tokens,
+        completed_hidden_steps,
+        thinking_end_detected,
+    )
+
+
+@torch.inference_mode()
 def ordinary_cot_answer(
     model,
     tokenizer,
@@ -729,6 +863,8 @@ def benchmark_config(args: argparse.Namespace, mode: str) -> dict:
         "soft_top_k": args.soft_top_k,
         "soft_top_k_warning_mass": args.soft_top_k_warning_mass,
         "entropy_stop": args.entropy_stop,
+        "interleaved_hidden_steps": args.interleaved_hidden_steps,
+        "interleaved_thinking_tokens": args.interleaved_thinking_tokens,
         "max_new_tokens": args.max_new_tokens,
         "output_temperature": args.output_temperature,
         "output_top_p": args.output_top_p,
@@ -743,7 +879,7 @@ def run_benchmark(
     cases: Sequence[dict],
     args: argparse.Namespace,
 ) -> list[dict]:
-    """Run all five conditions while reusing the one loaded model."""
+    """Run all six conditions while reusing the one loaded model."""
     entropy_stop = args.entropy_stop if args.entropy_stop >= 0 else None
     common = dict(
         model=model,
@@ -817,6 +953,16 @@ def run_benchmark(
                     return_visible_only=False,
                 ),
             ),
+            (
+                "interleaved_recurrent",
+                lambda: interleaved_recurrent_answer(
+                    **common,
+                    prompt=prompt,
+                    hidden_steps_per_token=args.interleaved_hidden_steps,
+                    max_thinking_tokens=args.interleaved_thinking_tokens,
+                    use_thinking_scaffold=args.use_thinking_scaffold,
+                )[0],
+            ),
         ]
         for mode, generate in mode_functions:
             started = time.perf_counter()
@@ -889,7 +1035,8 @@ def validate_cuda_environment(cuda_device_count: int | None = None) -> None:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run probability-weighted soft tokens or recurrent hidden states "
+            "Run probability-weighted soft tokens, recurrent hidden states, or "
+            "interleaved real tokens and hidden states "
             "through Qwen before decoding an answer."
         )
     )
@@ -908,7 +1055,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--benchmark",
         action="store_true",
-        help="Run the bundled five-mode benchmark instead of one prompt.",
+        help="Run the bundled six-mode benchmark instead of one prompt.",
     )
     parser.add_argument("--benchmark-file", type=Path, default=DEFAULT_BENCHMARK_FILE)
     parser.add_argument("--results-file", type=Path, default=DEFAULT_RESULTS_FILE)
@@ -927,6 +1074,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Benchmark difficulty to run; repeat to select several values.",
     )
     parser.add_argument("--soft-steps", type=int, default=8)
+    parser.add_argument(
+        "--interleaved-hidden-steps",
+        type=int,
+        default=2,
+        help="Hidden recurrent positions between interleaved thinking tokens.",
+    )
+    parser.add_argument(
+        "--interleaved-thinking-tokens",
+        type=int,
+        default=64,
+        help="Maximum real thinking tokens in interleaved recurrence.",
+    )
     parser.add_argument(
         "--soft-temperature",
         type=float,
@@ -966,13 +1125,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--disable-thinking-scaffold",
         dest="use_thinking_scaffold",
         action="store_false",
-        help="Begin soft/hard/hidden recurrence immediately after the template's <think>\\n.",
+        help="Begin soft/hard/hidden/interleaved recurrence immediately after the template's <think>\\n.",
     )
     parser.set_defaults(use_thinking_scaffold=True)
     parser.add_argument(
         "--compare",
         action="store_true",
-        help="Print baseline, hard-argmax, soft-recurrent, hidden-recurrent, and ordinary-CoT outputs.",
+        help="Print all six baseline, recurrence, and ordinary-CoT outputs.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument(
@@ -998,6 +1157,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--gpu0-max-memory and --gpu1-max-memory must be non-empty.")
     if args.soft_steps < 0 or args.max_new_tokens < 1:
         raise SystemExit("Step counts must be non-negative and max-new-tokens must be positive.")
+    if args.interleaved_hidden_steps < 0:
+        raise SystemExit("--interleaved-hidden-steps must be non-negative.")
+    if args.interleaved_thinking_tokens < 1:
+        raise SystemExit("--interleaved-thinking-tokens must be positive.")
     if args.soft_temperature is not None and args.soft_temperature <= 0:
         raise SystemExit("--soft-temperature must be positive.")
     if args.target_support <= 0:
@@ -1103,11 +1266,24 @@ def main() -> None:
             use_thinking_scaffold=args.use_thinking_scaffold,
         )
         cot = ordinary_cot_answer(**common)
+        interleaved, interleaved_thinking, interleaved_hidden, interleaved_end = (
+            interleaved_recurrent_answer(
+                **common,
+                hidden_steps_per_token=args.interleaved_hidden_steps,
+                max_thinking_tokens=args.interleaved_thinking_tokens,
+                use_thinking_scaffold=args.use_thinking_scaffold,
+            )
+        )
         print(f"\n=== No latent steps (baseline) ===\n{baseline}")
         print(f"\n=== Hard argmax steps ({hard_steps}) ===\n{hard}")
         print(f"\n=== Soft recurrent steps ({soft_completed}) ===\n{soft}")
         print(f"\n=== Hidden recurrent steps ({hidden_completed}) ===\n{hidden}")
         print(f"\n=== Ordinary visible CoT ===\n{cot}")
+        print(
+            f"\n=== Interleaved recurrent tokens ({interleaved_thinking}), "
+            f"hidden steps ({interleaved_hidden}), "
+            f"thinking end ({interleaved_end}) ===\n{interleaved}"
+        )
     else:
         answer, completed_steps = soft_recurrent_answer(
             **common,

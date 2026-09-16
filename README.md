@@ -3,7 +3,8 @@
 Experimental recurrence with the local Qwen3.5 checkpoint. Soft recurrence
 turns each next-token distribution into a weighted average of input embeddings;
 hidden recurrence feeds each latent position's final decoder hidden state back
-as the next sequence position.
+as the next sequence position. Interleaved recurrence alternates greedy real
+thinking tokens with a configurable gap of hidden positions.
 
 ## Setup
 
@@ -40,13 +41,14 @@ Benchmark JSONL result configs record both GPU limits.
 ```
 
 The Conversation tab keeps multi-turn history and supports soft recurrence,
-hidden-state recurrence, the no-latent baseline, hard argmax recurrence, and
-ordinary CoT. Text appears token by token; soft mode shows temperature,
+hidden-state recurrence, interleaved token/hidden recurrence, the no-latent
+baseline, hard argmax recurrence, and ordinary CoT. Text appears token by token; soft mode shows temperature,
 effective support, retained mass, and top candidates for every latent step,
-while hidden mode reports hidden-state RMS.
+while hidden and interleaved modes report hidden-state RMS.
 
-The benchmark runs all five modes sequentially from one loaded checkpoint:
-baseline, hard argmax, soft recurrence, hidden recurrence, and ordinary CoT.
+The benchmark runs all six modes sequentially from one loaded checkpoint:
+baseline, hard argmax, soft recurrence, hidden recurrence, ordinary CoT, and
+interleaved recurrence.
 The TUI case matrix updates live with extracted answers, and its summary shows
 accuracy, change from
 baseline, average latency, and output tokens per second. Its controls expose
@@ -85,6 +87,8 @@ Useful controls:
 
 ```text
 --soft-steps 8          maximum recurrent positions
+--interleaved-hidden-steps 2  hidden positions between real thinking tokens
+--interleaved-thinking-tokens 64  maximum real thinking tokens
 --soft-temperature 1.0 fixed distribution temperature (omit for adaptive)
 --soft-target-support 8 adaptive effective-support target
 --soft-temperature-min 0.1 / --soft-temperature-max 4.0 adaptive bounds
@@ -103,8 +107,19 @@ chosen temperature, effective support, entropy, retained mass, and embedding
 diagnostics. Low retained mass emits a warning and entropy stopping remains a
 guard against broad mixtures.
 
+Interleaved recurrence selects thinking tokens greedily, feeds each selected
+token through the cache, and then inserts the configured hidden gap before the
+next real token. Hidden positions therefore occur only between real tokens:
+with `N` real tokens and gap size `T`, the normal count is `T * (N - 1)`.
+If stopping interrupts a gap, the completed partial gap is retained and counted
+as an intentional exception. EOS is not fed as a thinking token. Natural
+`THINK_END` detection stops before its next gap, but the contiguous existing
+`THINK_END` anchor is always appended afterward; this deliberately guarantees
+an on-manifold answer transition when natural marker pieces would otherwise be
+separated by hidden positions.
+
 Use `--soft-steps 0` as the no-latent-step baseline. For a single-process
-comparison of five conditions, use:
+comparison of six conditions, use:
 
 ```bash
 .venv/bin/neuralese --compare --soft-steps 4 --max-new-tokens 256 \
@@ -112,9 +127,11 @@ comparison of five conditions, use:
 ```
 
 This prints labeled no-latent, hard-argmax, soft-recurrent, hidden-recurrent,
-and ordinary visible-CoT outputs. Hard steps feed selected IDs through the
-cache; hidden steps feed final decoder hidden states through the cache; ordinary
-CoT lets the model generate its normal thinking tokens. These are comparison
+ordinary visible-CoT, and interleaved outputs. Hard steps feed selected IDs
+through the cache; hidden steps feed final decoder hidden states through the
+cache; ordinary CoT lets the model generate its normal thinking tokens;
+interleaved recurrence combines greedy real thinking tokens with hidden gaps.
+These are comparison
 outputs only: evaluate each condition against an answer key; comparison alone
 does not establish utility or accuracy.
 
@@ -123,7 +140,7 @@ does not establish utility or accuracy.
 The bundled `benchmark_cases.jsonl` contains 28 original cases across
 arithmetic/unit conversion, state tracking, logic constraints, and symbolic
 algorithms: 16 `calibration` cases and 12 longer-chain `challenge` cases. Each
-requests an explicit `ANSWER:` line. Run all five modes in one model-loading
+requests an explicit `ANSWER:` line. Run all six modes in one model-loading
 process and write JSONL results with:
 
 ```bash
@@ -141,7 +158,7 @@ filter by tier. A recommended challenge-only run is:
 ```
 
 Results record the mode (`baseline`, `hard_argmax`, `soft_recurrent`,
-`hidden_recurrent`, or `ordinary_cot`), exact configuration, raw output,
+`hidden_recurrent`, `ordinary_cot`, or `interleaved_recurrent`), exact configuration, raw output,
 normalized extracted answer, correctness, status, and latency. Baseline uses
 the same chat/scaffold setup with zero latent positions; recurrent modes add
 the requested latent positions, while ordinary CoT uses normal visible-token

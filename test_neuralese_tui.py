@@ -6,6 +6,7 @@ from textual.widgets import DataTable, Input, Log, Select, TabbedContent
 from neuralese_tui import (
     MODES,
     NeuraleseTUI,
+    parse_nonnegative_int,
     parse_positive_float,
     parse_positive_int,
     summarize_results,
@@ -20,6 +21,7 @@ class TuiHelperTests(unittest.TestCase):
             parse_positive_int("0", "steps")
         with self.assertRaisesRegex(ValueError, "number"):
             parse_positive_float("many", "support")
+        self.assertEqual(parse_nonnegative_int("0", "hidden steps"), 0)
 
     def test_result_summary_is_grouped_by_mode(self) -> None:
         results = [
@@ -42,10 +44,20 @@ class TuiStructureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(app.query(DataTable)), 2)
             self.assertEqual(app.query_one("#chat-mode", Select).value, "soft_recurrent")
             self.assertEqual(app.query_one("#soft-steps", Input).value, "8")
-            self.assertEqual(len(MODES), 5)
-            self.assertEqual(app.query_one("#summary-table", DataTable).row_count, 5)
-            self.assertEqual(len(app.query_one("#case-table", DataTable).columns), 7)
-            self.assertEqual(len(app.query(".output-panel")), 5)
+            app.query_one("#interleaved-hidden-steps", Input).value = "0"
+            self.assertEqual(app._read_chat_settings()["hidden_steps_per_token"], 0)
+            app.query_one("#interleaved-hidden-steps", Input).value = "-1"
+            with self.assertRaisesRegex(ValueError, "non-negative"):
+                app._read_chat_settings()
+            app.query_one("#interleaved-hidden-steps", Input).value = "0"
+            app.query_one("#interleaved-thinking-tokens", Input).value = "0"
+            with self.assertRaisesRegex(ValueError, "positive"):
+                app._read_chat_settings()
+            app.query_one("#interleaved-thinking-tokens", Input).value = "64"
+            self.assertEqual(len(MODES), 6)
+            self.assertEqual(app.query_one("#summary-table", DataTable).row_count, 6)
+            self.assertEqual(len(app.query_one("#case-table", DataTable).columns), 8)
+            self.assertEqual(len(app.query(".output-panel")), 6)
 
             # The width must be measured from the rendered content area, not
             # just the CSS width: Input borders and padding consume columns.
@@ -55,6 +67,8 @@ class TuiStructureTests(unittest.IsolatedAsyncioTestCase):
                 "#soft-steps",
                 "#target-support",
                 "#max-tokens",
+                "#interleaved-hidden-steps",
+                "#interleaved-thinking-tokens",
             )
             for selector in chat_inputs:
                 input_widget = app.query_one(selector, Input)
@@ -68,8 +82,7 @@ class TuiStructureTests(unittest.IsolatedAsyncioTestCase):
             # benchmark toolbar before checking its actual usable width.
             app.query_one(TabbedContent).active = "benchmark"
             await pilot.pause()
-            # The five panes use a two-column grid; the fifth pane flows onto
-            # the third row so every actual pane remains usable.
+            # The six panes use a two-column, three-row grid.
             for panel in app.query(".output-panel"):
                 self.assertGreater(panel.region.width, 0)
                 self.assertGreater(panel.region.height, 0)
@@ -82,6 +95,8 @@ class TuiStructureTests(unittest.IsolatedAsyncioTestCase):
                 "#benchmark-max-temperature",
                 "#benchmark-entropy-stop",
                 "#benchmark-max-tokens",
+                "#benchmark-interleaved-hidden-steps",
+                "#benchmark-interleaved-thinking-tokens",
             )
             for selector in benchmark_inputs:
                 input_widget = app.query_one(selector, Input)
@@ -105,12 +120,25 @@ class TuiStructureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(adaptive["target_support"], 8.0)
             self.assertEqual(adaptive["soft_top_k"], 64)
             self.assertEqual(adaptive["max_new_tokens"], 512)
+            app.query_one("#benchmark-interleaved-hidden-steps", Input).value = "0"
+            self.assertEqual(app._read_benchmark_settings()["hidden_steps_per_token"], 0)
+            app.query_one("#benchmark-interleaved-hidden-steps", Input).value = "-1"
+            with self.assertRaisesRegex(ValueError, "non-negative"):
+                app._read_benchmark_settings()
+            app.query_one("#benchmark-interleaved-hidden-steps", Input).value = "0"
+            app.query_one("#benchmark-interleaved-thinking-tokens", Input).value = "0"
+            with self.assertRaisesRegex(ValueError, "positive"):
+                app._read_benchmark_settings()
+            app.query_one("#benchmark-interleaved-thinking-tokens", Input).value = "64"
+            app.query_one("#benchmark-interleaved-hidden-steps", Input).value = "2"
 
             app.query_one("#benchmark-softmax-mode", Select).value = "fixed"
             app.query_one("#benchmark-temperature", Input).value = "0.8"
             app._sync_softmax_controls()
             fixed = app._read_benchmark_settings()
             self.assertEqual(fixed["soft_temperature"], 0.8)
+            self.assertEqual(fixed["hidden_steps_per_token"], 2)
+            self.assertEqual(fixed["max_thinking_tokens"], 64)
 
             app._append_output("#output-baseline", "hello", False)
             app._append_output("#output-baseline", " world\nnext", False)
@@ -131,6 +159,12 @@ class TuiStructureTests(unittest.IsolatedAsyncioTestCase):
         app = NeuraleseTUI(autoload=False)
         async with app.run_test(size=(160, 50)) as pilot:
             app._prepare_benchmark([case])
+            row = app.query_one("#case-table", DataTable).get_row("demo")
+            self.assertEqual(len(row), 8)
+            self.assertEqual(
+                app.query_one("#case-table", DataTable).get_cell("demo", "interleaved_recurrent"),
+                "·",
+            )
             self.assertEqual(app.query_one("#benchmark-progress").total, len(MODES))
             app._mark_running(case, "soft_recurrent")
             app.results.append(result)
@@ -178,6 +212,35 @@ class TuiStructureTests(unittest.IsolatedAsyncioTestCase):
         hidden.assert_called_once()
         self.assertEqual(hidden.call_args.kwargs["latent_steps"], 3)
         self.assertEqual(completed_steps, [1])
+
+    def test_interleaved_mode_routes_callback_and_counts(self) -> None:
+        app = NeuraleseTUI(autoload=False)
+        app.model = object()
+        app.tokenizer = object()
+        settings = {
+            "soft_steps": 3, "target_support": 8.0, "max_new_tokens": 16,
+            "soft_temperature": None, "soft_top_k": 64, "entropy_stop": 0.75,
+            "min_soft_temperature": 0.1, "max_soft_temperature": 4.0,
+            "hidden_steps_per_token": 2, "max_thinking_tokens": 64,
+        }
+        seen = []
+        completed = []
+
+        def fake_interleaved(**kwargs):
+            kwargs["on_interleaved_token"](3, "step", 6, 0.25)
+            return "answer", 3, 6, True
+
+        with patch("neuralese_tui.interleaved_recurrent_answer", side_effect=fake_interleaved) as routed:
+            answer = app._generate_mode(
+                "interleaved_recurrent", "prompt", settings, lambda _: None,
+                on_interleaved_token=lambda *args: seen.append(args),
+                on_interleaved_complete=lambda *args: completed.append(args),
+            )
+        self.assertEqual(answer, "answer")
+        routed.assert_called_once()
+        self.assertEqual(seen, [(3, "step", 6, 0.25)])
+        self.assertEqual(completed, [(3, 6, True)])
+        self.assertEqual(routed.call_args.kwargs["hidden_steps_per_token"], 2)
 
 
 if __name__ == "__main__":

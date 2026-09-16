@@ -40,6 +40,7 @@ from neuralese import (
     build_max_memory_map,
     hard_argmax_answer,
     hidden_recurrent_answer,
+    interleaved_recurrent_answer,
     load_benchmark_cases,
     ordinary_cot_answer,
     score_answer,
@@ -49,13 +50,14 @@ from neuralese import (
 )
 
 
-MODES = ("baseline", "hard_argmax", "soft_recurrent", "hidden_recurrent", "ordinary_cot")
+MODES = ("baseline", "hard_argmax", "soft_recurrent", "hidden_recurrent", "ordinary_cot", "interleaved_recurrent")
 MODE_LABELS = {
     "baseline": "Baseline",
     "hard_argmax": "Hard argmax",
     "soft_recurrent": "Soft recurrent",
     "hidden_recurrent": "Hidden recurrent",
     "ordinary_cot": "Ordinary CoT",
+    "interleaved_recurrent": "Interleaved recurrent",
 }
 
 
@@ -190,6 +192,7 @@ class NeuraleseTUI(App):
                             ("Baseline", "baseline"),
                             ("Hard argmax", "hard_argmax"),
                             ("Ordinary CoT", "ordinary_cot"),
+                            ("Interleaved", "interleaved_recurrent"),
                         ],
                         value="soft_recurrent",
                         allow_blank=False,
@@ -203,6 +206,12 @@ class NeuraleseTUI(App):
                     yield Label("Tokens")
                     yield Input("256", type="integer", id="max-tokens", classes="small-input")
                     yield Button("Clear", id="clear-chat")
+                with Horizontal(classes="toolbar"):
+                    yield Label("Hidden/token")
+                    yield Input("2", type="integer", id="interleaved-hidden-steps", classes="small-input")
+                    yield Label("Thinking tokens")
+                    yield Input("64", type="integer", id="interleaved-thinking-tokens", classes="small-input")
+                    yield Label("Interleaved settings apply only to Interleaved mode", id="chat-interleaved-help")
                 with Grid(id="chat-layout"):
                     with Vertical(id="chat-main"):
                         yield RichLog(id="chat-transcript", markup=True, wrap=True)
@@ -211,7 +220,7 @@ class NeuraleseTUI(App):
                             yield Input(placeholder="Ask a follow-up…", id="chat-input")
                             yield Button("Send", id="send", variant="primary", disabled=True)
                     with Vertical(id="chat-side"):
-                        yield Label("Soft-step diagnostics", classes="output-title")
+                        yield Label("Recurrence diagnostics", classes="output-title")
                         yield RichLog(id="chat-trace", markup=True, wrap=True)
             with TabPane("Benchmark", id="benchmark"):
                 with Horizontal(classes="toolbar"):
@@ -252,8 +261,14 @@ class NeuraleseTUI(App):
                     yield Button("Stop", id="stop", variant="warning", disabled=True)
                     yield ProgressBar(total=len(MODES), show_eta=True, id="benchmark-progress")
                     yield Label("Ready", id="benchmark-status")
+                with Horizontal(classes="toolbar"):
+                    yield Label("Hidden/token")
+                    yield Input("2", type="integer", id="benchmark-interleaved-hidden-steps", classes="small-input")
+                    yield Label("Thinking tokens")
+                    yield Input("64", type="integer", id="benchmark-interleaved-thinking-tokens", classes="small-input")
+                    yield Label("Interleaved settings apply only to Interleaved mode", id="benchmark-interleaved-help")
                 yield Static(
-                    "Steps controls latent duration; support = exp(entropy) controls mixture breadth. Negative entropy stop disables early exit.",
+                    "Steps applies to hard/soft/hidden; support/temperature/top-k/entropy are soft-only. Interleaved uses Hidden/token and Thinking tokens. Negative entropy stop disables soft early exit.",
                     id="benchmark-help",
                 )
                 with Grid(id="benchmark-layout"):
@@ -285,6 +300,7 @@ class NeuraleseTUI(App):
             ("Soft", "soft_recurrent"),
             ("Hidden", "hidden_recurrent"),
             ("CoT", "ordinary_cot"),
+            ("Interleaved", "interleaved_recurrent"),
         ):
             case_table.add_column(label, key=key)
         summary = self.query_one("#summary-table", DataTable)
@@ -385,6 +401,14 @@ class NeuraleseTUI(App):
             "entropy_stop": 0.75,
             "min_soft_temperature": 0.1,
             "max_soft_temperature": 4.0,
+            "hidden_steps_per_token": parse_nonnegative_int(
+                self.query_one("#interleaved-hidden-steps", Input).value,
+                "Hidden steps per token",
+            ),
+            "max_thinking_tokens": parse_positive_int(
+                self.query_one("#interleaved-thinking-tokens", Input).value,
+                "Max thinking tokens",
+            ),
         }
 
     def _read_benchmark_settings(self) -> dict:
@@ -428,6 +452,14 @@ class NeuraleseTUI(App):
             "entropy_stop": None if entropy_stop < 0 else entropy_stop,
             "min_soft_temperature": minimum,
             "max_soft_temperature": maximum,
+            "hidden_steps_per_token": parse_nonnegative_int(
+                self.query_one("#benchmark-interleaved-hidden-steps", Input).value,
+                "Hidden steps per token",
+            ),
+            "max_thinking_tokens": parse_positive_int(
+                self.query_one("#benchmark-interleaved-thinking-tokens", Input).value,
+                "Max thinking tokens",
+            ),
         }
 
     def _update_text(self, selector: str, text: str) -> None:
@@ -446,6 +478,12 @@ class NeuraleseTUI(App):
 
     def _hidden_trace(self, index, rms: float) -> None:
         self.call_from_thread(self._append_trace, f"[bold]{index:02d}[/] hidden latent · RMS={rms:.4f}")
+
+    def _interleaved_trace(self, index: int, text: str, hidden_steps: int, rms: float) -> None:
+        self.call_from_thread(
+            self._append_trace,
+            f"[bold]{index:02d}[/] {text!r} · hidden gap={hidden_steps} · RMS={rms:.4f}",
+        )
 
     def _stream_to(self, selector: str) -> Callable[[str], None]:
         started = time.perf_counter()
@@ -523,6 +561,8 @@ class NeuraleseTUI(App):
         on_soft_step: Callable | None = None,
         on_hidden_step: Callable | None = None,
         on_hidden_complete: Callable[[int], None] | None = None,
+        on_interleaved_token: Callable | None = None,
+        on_interleaved_complete: Callable[[int, int, bool], None] | None = None,
     ) -> str:
         common = self._common_generation(settings)
         common["prompt"] = prompt
@@ -559,6 +599,17 @@ class NeuraleseTUI(App):
             )
             if on_hidden_complete is not None:
                 on_hidden_complete(completed_steps)
+            return answer
+        if mode == "interleaved_recurrent":
+            answer, thinking_tokens, hidden_steps, thinking_end = interleaved_recurrent_answer(
+                **common,
+                hidden_steps_per_token=settings["hidden_steps_per_token"],
+                max_thinking_tokens=settings["max_thinking_tokens"],
+                use_thinking_scaffold=True,
+                on_interleaved_token=on_interleaved_token,
+            )
+            if on_interleaved_complete is not None:
+                on_interleaved_complete(thinking_tokens, hidden_steps, thinking_end)
             return answer
         return soft_recurrent_answer(
             **common,
@@ -603,6 +654,7 @@ class NeuraleseTUI(App):
                 messages=messages,
                 on_soft_step=self._soft_trace,
                 on_hidden_step=self._hidden_trace,
+                on_interleaved_token=self._interleaved_trace,
             )
         except Exception as error:
             self.call_from_thread(
@@ -639,9 +691,9 @@ class NeuraleseTUI(App):
         table = self.query_one("#case-table", DataTable)
         table.clear()
         for case in cases:
-            table.add_row(
-                case["id"], case["category"].replace("_", " "), "·", "·", "·", "·", "·", key=case["id"]
-            )
+            cells = [case["id"], case["category"].replace("_", " "), *(["·"] * 6)]
+            assert len(cells) == 8
+            table.add_row(*cells, key=case["id"])
         progress = self.query_one("#benchmark-progress", ProgressBar)
         progress.update(total=len(cases) * len(MODES), progress=0)
         self.query_one("#benchmark-status", Label).update(f"0/{len(cases) * len(MODES)}")
@@ -714,7 +766,14 @@ class NeuraleseTUI(App):
                 self.call_from_thread(self._mark_running, case, mode)
                 started = time.perf_counter()
                 error = None
-                latent_metrics = {"attempted": 0, "completed": 0, "entropy_stopped": False}
+                latent_metrics = {
+                    "attempted": 0,
+                    "completed": 0,
+                    "entropy_stopped": False,
+                    "thinking_tokens": 0,
+                    "thinking_end_detected": False,
+                    "rms": None,
+                }
                 stream, stream_metrics = self._stream_to_log(
                     f"#output-{mode}", mode, case["id"]
                 )
@@ -744,6 +803,31 @@ class NeuraleseTUI(App):
                         f"{MODE_LABELS[mode]} · {case['id']} · latent {index}/{settings['soft_steps']} · RMS={rms:.4f}",
                     )
 
+                def interleaved_token(index: int, text: str, hidden_steps: int, rms: float) -> None:
+                    latent_metrics["thinking_tokens"] = index
+                    latent_metrics["completed"] = hidden_steps
+                    latent_metrics["thinking_end_detected"] = False
+                    latent_metrics["rms"] = rms
+                    self.call_from_thread(
+                        self._update_output_title,
+                        mode,
+                        f"{MODE_LABELS[mode]} · {case['id']} · thinking {index}/{settings['max_thinking_tokens']} · hidden {hidden_steps} · RMS={rms:.4f}",
+                    )
+
+                def interleaved_complete(thinking: int, hidden: int, ended: bool) -> None:
+                    latent_metrics.update(
+                        thinking_tokens=thinking,
+                        completed=hidden,
+                        thinking_end_detected=ended,
+                    )
+                    self.call_from_thread(
+                        self._update_output_title,
+                        mode,
+                        f"{MODE_LABELS[mode]} · {case['id']} · thinking {thinking} · hidden {hidden} · RMS={latent_metrics['rms']:.4f} · {'natural end' if ended else 'limit/stop'}"
+                        if latent_metrics["rms"] is not None
+                        else f"{MODE_LABELS[mode]} · {case['id']} · thinking {thinking} · hidden {hidden} · {'natural end' if ended else 'limit/stop'}",
+                    )
+
                 try:
                     raw = self._generate_mode(
                         mode,
@@ -755,6 +839,9 @@ class NeuraleseTUI(App):
                         on_hidden_complete=(
                             lambda completed: latent_metrics.__setitem__("completed", completed)
                         ) if mode == "hidden_recurrent" else None,
+                        on_interleaved_token=interleaved_token if mode == "interleaved_recurrent" else None,
+                        on_interleaved_complete=interleaved_complete
+                        if mode == "interleaved_recurrent" else None,
                     )
                 except Exception as caught:
                     raw = ""
@@ -792,7 +879,11 @@ class NeuraleseTUI(App):
                     else None,
                     "latent_steps_completed": latent_metrics["completed"]
                     if mode in ("soft_recurrent", "hidden_recurrent")
-                    else None,
+                    else latent_metrics["completed"] if mode == "interleaved_recurrent" else None,
+                    "thinking_tokens_completed": latent_metrics.get("thinking_tokens")
+                    if mode == "interleaved_recurrent" else None,
+                    "thinking_end_detected": latent_metrics.get("thinking_end_detected")
+                    if mode == "interleaved_recurrent" else None,
                     "latent_entropy_stopped": latent_metrics["entropy_stopped"]
                     if mode == "soft_recurrent"
                     else None,

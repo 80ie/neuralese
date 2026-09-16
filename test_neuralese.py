@@ -17,6 +17,7 @@ from neuralese import (
     distribution_stats,
     extract_answer,
     hidden_recurrent_answer,
+    interleaved_recurrent_answer,
     load_benchmark_cases,
     normalize_answer,
     parse_args,
@@ -24,6 +25,7 @@ from neuralese import (
     select_benchmark_cases,
     score_answer,
     validate_cuda_environment,
+    validate_args,
 )
 
 
@@ -217,8 +219,166 @@ class HiddenRecurrentTests(unittest.TestCase):
         self.assertEqual(sum("inputs_embeds" in call for call in model.base_calls), 0)
 
 
+class InterleavedTokenizer(FakeTokenizer):
+    def __init__(self, natural_end=False):
+        self.natural_end = natural_end
+
+    def decode(self, token_ids, **kwargs):
+        ids = list(token_ids)
+        if self.natural_end and ids == [10, 11]:
+            return "x" + "\n</think>\n\n"
+        if ids == [1]:
+            return "ANSWER: 42"
+        names = {10: "a", 11: "b", 12: "c"}
+        return "".join(names.get(token_id, "") for token_id in ids)
+
+
+class InterleavedOutputEmbeddings(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(100, 3))
+
+    def forward(self, hidden):
+        logits = torch.full((*hidden.shape[:-1], 100), -100.0)
+        states = hidden[..., 0].round().long()
+        # The logits immediately after real10/real11 deliberately point at a
+        # different token than the logits after their hidden gaps.  A stale
+        # real-token logit would therefore select 13 instead of the expected
+        # next token.
+        for state, token_id in ((10, 13), (11, 13), (12, 11), (13, 12)):
+            logits[..., token_id] = torch.where(
+                states == state, torch.tensor(10.0), logits[..., token_id]
+            )
+        logits[..., 99] = torch.where(
+            states >= 14, torch.tensor(10.0), logits[..., 99]
+        )
+        return logits
+
+
+class InterleavedModel(FakeHiddenModel):
+    def __init__(self):
+        super().__init__()
+        self.output_embeddings = InterleavedOutputEmbeddings()
+        self.trace = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if "input_ids" in kwargs and "past_key_values" not in kwargs:
+            self.trace.append(("prime", kwargs["input_ids"].tolist(), None))
+            return SimpleNamespace(past_key_values="prompt-cache", logits=self._prime_logits())
+        if "input_ids" in kwargs:
+            is_anchor = int(kwargs["input_ids"][0, -1]) == 9
+            self.trace.append((
+                "anchor" if is_anchor else "visible",
+                int(kwargs["input_ids"][0, 0]),
+                kwargs.get("past_key_values"),
+            ))
+            logits = torch.zeros(1, kwargs["input_ids"].shape[1], 100)
+            if is_anchor:
+                logits[:, :, 1] = 10.0
+            else:
+                logits[:, :, 99] = 10.0
+            return SimpleNamespace(past_key_values="visible-cache", logits=logits)
+        raise AssertionError("unexpected wrapper call")
+
+    @staticmethod
+    def _prime_logits():
+        logits = torch.full((1, 2, 100), -100.0)
+        logits[:, -1, 10] = 10.0
+        return logits
+
+
+class InterleavedTextModel(FakeTextModel):
+    def __call__(self, **kwargs):
+        self.owner.base_calls.append(kwargs)
+        self.owner._cache_number += 1
+        if "input_ids" in kwargs:
+            token_id = int(kwargs["input_ids"][0, -1])
+            value = float(token_id)
+            kind = "real"
+        else:
+            # Each latent position advances the recurrent state, so logits
+            # from the preceding real token are observably stale.
+            value = float(kwargs["inputs_embeds"][0, -1, 0]) + 1
+            kind = "hidden"
+        self.owner.trace.append((kind, int(value), kwargs.get("past_key_values")))
+        hidden = torch.full((1, 1, 3), value)
+        return SimpleNamespace(
+            past_key_values=f"cache-{self.owner._cache_number}",
+            last_hidden_state=hidden,
+        )
+
+
+class InterleavedTests(unittest.TestCase):
+    def test_token_first_schedule_uses_final_latent_logits_and_contiguous_anchor(self):
+        model = InterleavedModel()
+        model.model = InterleavedTextModel(model)
+        callbacks = []
+        answer, thinking, hidden, ended = interleaved_recurrent_answer(
+            model, InterleavedTokenizer(), "question", 2, 3, 1, 0.0, 1.0, 0,
+            on_interleaved_token=lambda *event: callbacks.append(event),
+        )
+        self.assertEqual((answer, thinking, hidden, ended), ("ANSWER: 42", 3, 4, False))
+        self.assertEqual(
+            [(kind, value) for kind, value, _ in model.trace[1:] if kind != "visible"],
+            [("real", 10), ("hidden", 11), ("hidden", 12),
+             ("real", 11), ("hidden", 12), ("hidden", 13), ("real", 12),
+             ("anchor", 8)],
+        )
+        self.assertEqual([event[:3] for event in callbacks], [(1, "a", 2), (2, "b", 4), (3, "c", 4)])
+        self.assertEqual([event[3] for event in callbacks], [12.0, 13.0, 12.0])
+        self.assertEqual(model.trace[1][2], "prompt-cache")
+        self.assertEqual(model.trace[4][2], "cache-3")
+        self.assertEqual(model.trace[7][2], "cache-6")
+        self.assertEqual(model.trace[8][2], "cache-7")
+
+    def test_natural_end_stops_before_gap_but_still_appends_anchor(self):
+        model = InterleavedModel()
+        model.model = InterleavedTextModel(model)
+        tokenizer = InterleavedTokenizer(natural_end=True)
+        answer, thinking, hidden, ended = interleaved_recurrent_answer(
+            model, tokenizer, "question", 2, 4, 1, 0.0, 1.0, 0,
+        )
+        self.assertEqual((answer, thinking, hidden, ended), ("ANSWER: 42", 2, 2, True))
+        self.assertEqual([kind for kind, _, _ in model.trace[1:] if kind != "visible"],
+                         ["real", "hidden", "hidden", "real", "anchor"])
+        self.assertEqual(next(value for kind, value, _ in reversed(model.trace) if kind == "anchor"), 8)
+
+    def test_stop_in_gap_and_eos_do_not_consume_extra_positions(self):
+        model = InterleavedModel()
+        model.model = InterleavedTextModel(model)
+        checks = 0
+
+        def stop_in_second_hidden():
+            nonlocal checks
+            checks += 1
+            return checks == 3  # before first token, before hidden 1, before hidden 2
+
+        answer, thinking, hidden, ended = interleaved_recurrent_answer(
+            model, InterleavedTokenizer(), "question", 2, 4, 1, 0.0, 1.0, 0,
+            should_stop=stop_in_second_hidden,
+        )
+        self.assertEqual((answer, thinking, hidden, ended), ("ANSWER: 42", 1, 1, False))
+        self.assertEqual([kind for kind, _, _ in model.trace[1:] if kind != "visible"], ["real", "hidden", "anchor"])
+
+        model = InterleavedModel()
+        model.model = InterleavedTextModel(model)
+        model.output_embeddings = InterleavedOutputEmbeddings()
+        # Make the first real token's logits select EOS on the next iteration.
+        model.output_embeddings.forward = lambda hidden: torch.cat(
+            (torch.full((*hidden.shape[:-1], 99), -100.0),
+             torch.full((*hidden.shape[:-1], 1), 10.0)), dim=-1
+        )
+        answer, thinking, hidden, ended = interleaved_recurrent_answer(
+            model, InterleavedTokenizer(), "question", 2, 4, 1, 0.0, 1.0, 0,
+        )
+        self.assertEqual((answer, thinking, hidden, ended), ("ANSWER: 42", 1, 2, False))
+        self.assertEqual([kind for kind, _, _ in model.trace[1:] if kind != "visible"],
+                         ["real", "hidden", "hidden", "anchor"])
+
+
 class BenchmarkTests(unittest.TestCase):
-    def test_run_benchmark_keeps_five_modes_in_order_after_execution_error(self):
+    def test_run_benchmark_keeps_six_modes_in_order_after_execution_error(self):
         args = parse_args(["--benchmark", "--soft-steps", "2"])
         case = {
             "id": "demo",
@@ -238,18 +398,26 @@ class BenchmarkTests(unittest.TestCase):
         def hidden(**kwargs):
             raise RuntimeError("hidden failed")
 
+        def interleaved(**kwargs):
+            return "ANSWER: 42", 2, 4, False
+
         with patch("neuralese.soft_recurrent_answer", side_effect=soft), \
              patch("neuralese.hard_argmax_answer", side_effect=hard), \
              patch("neuralese.hidden_recurrent_answer", side_effect=hidden), \
+             patch("neuralese.interleaved_recurrent_answer", side_effect=interleaved), \
              patch("neuralese.ordinary_cot_answer", return_value="ANSWER: 42"):
             results = run_benchmark(object(), object(), [case], args)
 
         self.assertEqual(
             [result["mode"] for result in results],
-            ["baseline", "hard_argmax", "soft_recurrent", "hidden_recurrent", "ordinary_cot"],
+            [
+                "baseline", "hard_argmax", "soft_recurrent", "hidden_recurrent",
+                "ordinary_cot", "interleaved_recurrent",
+            ],
         )
         self.assertEqual(results[3]["status"], "execution_error: RuntimeError: hidden failed")
         self.assertEqual(results[4]["raw_output"], "ANSWER: 42")
+        self.assertEqual(results[5]["raw_output"], "ANSWER: 42")
 
 
 class DistributionStatsTests(unittest.TestCase):
@@ -340,6 +508,21 @@ class CliTests(unittest.TestCase):
         self.assertTrue(args.compare)
         self.assertEqual(args.soft_steps, 3)
         self.assertEqual(args.max_new_tokens, 11)
+
+    def test_interleaved_defaults_and_validation(self) -> None:
+        args = parse_args(["question"])
+        self.assertEqual(args.interleaved_hidden_steps, 2)
+        self.assertEqual(args.interleaved_thinking_tokens, 64)
+        args.model = Path(".")
+        validate_args(args)
+        invalid_gap = parse_args(["question", "--interleaved-hidden-steps", "-1"])
+        invalid_gap.model = Path(".")
+        with self.assertRaisesRegex(SystemExit, "interleaved-hidden-steps"):
+            validate_args(invalid_gap)
+        invalid_tokens = parse_args(["question", "--interleaved-thinking-tokens", "0"])
+        invalid_tokens.model = Path(".")
+        with self.assertRaisesRegex(SystemExit, "interleaved-thinking-tokens"):
+            validate_args(invalid_tokens)
 
     def test_benchmark_file_has_four_categories_and_unique_cases(self) -> None:
         cases = load_benchmark_cases(Path(__file__).with_name("benchmark_cases.jsonl"))
@@ -456,6 +639,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config["gpu0_max_memory"], DEFAULT_GPU0_MAX_MEMORY)
         self.assertEqual(config["gpu1_max_memory"], DEFAULT_GPU1_MAX_MEMORY)
         self.assertEqual(config["soft_steps"], 3)
+        self.assertEqual(config["interleaved_hidden_steps"], 2)
+        self.assertEqual(config["interleaved_thinking_tokens"], 64)
         self.assertEqual(config["max_new_tokens"], 512)
 
     def test_difficulty_filter_is_repeatable_and_rejects_unknown_values(self) -> None:
