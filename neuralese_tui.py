@@ -39,6 +39,7 @@ from neuralese import (
     DEFAULT_MODEL,
     build_max_memory_map,
     hard_argmax_answer,
+    hidden_recurrent_answer,
     load_benchmark_cases,
     ordinary_cot_answer,
     score_answer,
@@ -48,11 +49,12 @@ from neuralese import (
 )
 
 
-MODES = ("baseline", "hard_argmax", "soft_recurrent", "ordinary_cot")
+MODES = ("baseline", "hard_argmax", "soft_recurrent", "hidden_recurrent", "ordinary_cot")
 MODE_LABELS = {
     "baseline": "Baseline",
     "hard_argmax": "Hard argmax",
     "soft_recurrent": "Soft recurrent",
+    "hidden_recurrent": "Hidden recurrent",
     "ordinary_cot": "Ordinary CoT",
 }
 
@@ -116,10 +118,12 @@ class NeuraleseTUI(App):
     Header { background: #542f1f; }
     #status-bar { height: 1; padding: 0 1; background: #28231f; color: #e8b68f; }
     TabbedContent { height: 1fr; }
-    .toolbar { height: 3; padding: 0 1; align-vertical: middle; }
+    .toolbar { height: 3; padding: 0 1; align-vertical: middle; overflow-x: auto; overflow-y: hidden; }
     .toolbar Label { width: auto; margin: 0 1 0 0; }
-    .small-input { width: 9; margin-right: 1; }
-    .medium-select { width: 18; margin-right: 1; }
+    /* Keep controls at their useful size. Flex shrinking made the inputs
+       collapse to only a couple of visible characters in the benchmark bar. */
+    .small-input { width: 14; min-width: 14; padding: 0 1; margin-right: 1; }
+    .medium-select { width: 18; min-width: 18; margin-right: 1; }
     Button { margin-right: 1; min-width: 10; }
     #chat-layout { height: 1fr; grid-size: 2 1; grid-columns: 2fr 1fr; grid-gutter: 1; }
     #chat-main, #chat-side { height: 1fr; }
@@ -131,7 +135,10 @@ class NeuraleseTUI(App):
     #benchmark-layout { height: 1fr; grid-size: 2 2; grid-columns: 3fr 2fr; grid-rows: 2fr 3fr; grid-gutter: 0; padding: 0 1 1 1; }
     #case-table { height: 1fr; border: round #6f4a35; }
     #summary-table { height: 1fr; border: round #6f4a35; }
-    #output-grid { column-span: 2; height: 1fr; grid-size: 2 2; grid-gutter: 0; }
+    /* Keep the output grid to two columns.  Textual's CSS has no media-query
+       support, and a fixed two-column grid naturally reflows the fifth pane
+       onto a third row while retaining useful widths on small terminals. */
+    #output-grid { column-span: 2; height: 1fr; grid-size: 2 3; grid-columns: 1fr 1fr; grid-rows: 1fr 1fr 1fr; grid-gutter: 1; }
     .output-panel { height: 1fr; border: round #6f4a35; }
     .output-title { height: 1; padding: 0 1; background: #28231f; color: #e8b68f; }
     .output-text { height: 1fr; }
@@ -179,6 +186,7 @@ class NeuraleseTUI(App):
                     yield Select(
                         [
                             ("Soft recurrent", "soft_recurrent"),
+                            ("Hidden recurrent", "hidden_recurrent"),
                             ("Baseline", "baseline"),
                             ("Hard argmax", "hard_argmax"),
                             ("Ordinary CoT", "ordinary_cot"),
@@ -242,7 +250,7 @@ class NeuraleseTUI(App):
                     yield Input("512", type="integer", id="benchmark-max-tokens", classes="small-input")
                     yield Button("Run", id="run-benchmark", variant="primary", disabled=True)
                     yield Button("Stop", id="stop", variant="warning", disabled=True)
-                    yield ProgressBar(total=48, show_eta=True, id="benchmark-progress")
+                    yield ProgressBar(total=len(MODES), show_eta=True, id="benchmark-progress")
                     yield Label("Ready", id="benchmark-status")
                 yield Static(
                     "Steps controls latent duration; support = exp(entropy) controls mixture breadth. Negative entropy stop disables early exit.",
@@ -275,6 +283,7 @@ class NeuraleseTUI(App):
             ("Base", "baseline"),
             ("Hard", "hard_argmax"),
             ("Soft", "soft_recurrent"),
+            ("Hidden", "hidden_recurrent"),
             ("CoT", "ordinary_cot"),
         ):
             case_table.add_column(label, key=key)
@@ -435,6 +444,9 @@ class NeuraleseTUI(App):
         )
         self.call_from_thread(self._append_trace, line)
 
+    def _hidden_trace(self, index, rms: float) -> None:
+        self.call_from_thread(self._append_trace, f"[bold]{index:02d}[/] hidden latent · RMS={rms:.4f}")
+
     def _stream_to(self, selector: str) -> Callable[[str], None]:
         started = time.perf_counter()
         tokens = 0
@@ -509,6 +521,8 @@ class NeuraleseTUI(App):
         on_text: Callable[[str], None],
         messages: Sequence[dict] | None = None,
         on_soft_step: Callable | None = None,
+        on_hidden_step: Callable | None = None,
+        on_hidden_complete: Callable[[int], None] | None = None,
     ) -> str:
         common = self._common_generation(settings)
         common["prompt"] = prompt
@@ -536,6 +550,16 @@ class NeuraleseTUI(App):
                 **common,
                 return_visible_only=messages is not None,
             )
+        if mode == "hidden_recurrent":
+            answer, completed_steps = hidden_recurrent_answer(
+                **common,
+                latent_steps=settings["soft_steps"],
+                use_thinking_scaffold=True,
+                on_hidden_step=on_hidden_step,
+            )
+            if on_hidden_complete is not None:
+                on_hidden_complete(completed_steps)
+            return answer
         return soft_recurrent_answer(
             **common,
             soft_steps=settings["soft_steps"],
@@ -578,6 +602,7 @@ class NeuraleseTUI(App):
                 self._stream_to("#chat-live"),
                 messages=messages,
                 on_soft_step=self._soft_trace,
+                on_hidden_step=self._hidden_trace,
             )
         except Exception as error:
             self.call_from_thread(
@@ -615,11 +640,11 @@ class NeuraleseTUI(App):
         table.clear()
         for case in cases:
             table.add_row(
-                case["id"], case["category"].replace("_", " "), "·", "·", "·", "·", key=case["id"]
+                case["id"], case["category"].replace("_", " "), "·", "·", "·", "·", "·", key=case["id"]
             )
         progress = self.query_one("#benchmark-progress", ProgressBar)
         progress.update(total=len(cases) * len(MODES), progress=0)
-        self.query_one("#benchmark-status", Label).update(f"0/{len(cases) * 4}")
+        self.query_one("#benchmark-status", Label).update(f"0/{len(cases) * len(MODES)}")
         for mode in MODES:
             self.query_one(f"#output-{mode}", Log).clear()
 
@@ -710,6 +735,15 @@ class NeuraleseTUI(App):
                         f"{MODE_LABELS[mode]} · {case['id']} · {state} · T={step.temperature:.2f} · S={step.effective_support:.1f}",
                     )
 
+                def hidden_step(index, rms: float) -> None:
+                    latent_metrics["attempted"] = index
+                    latent_metrics["completed"] = index
+                    self.call_from_thread(
+                        self._update_output_title,
+                        mode,
+                        f"{MODE_LABELS[mode]} · {case['id']} · latent {index}/{settings['soft_steps']} · RMS={rms:.4f}",
+                    )
+
                 try:
                     raw = self._generate_mode(
                         mode,
@@ -717,6 +751,10 @@ class NeuraleseTUI(App):
                         settings,
                         stream,
                         on_soft_step=soft_step if mode == "soft_recurrent" else None,
+                        on_hidden_step=hidden_step if mode == "hidden_recurrent" else None,
+                        on_hidden_complete=(
+                            lambda completed: latent_metrics.__setitem__("completed", completed)
+                        ) if mode == "hidden_recurrent" else None,
                     )
                 except Exception as caught:
                     raw = ""
@@ -753,7 +791,7 @@ class NeuraleseTUI(App):
                     if time_to_first_token_ms is not None
                     else None,
                     "latent_steps_completed": latent_metrics["completed"]
-                    if mode == "soft_recurrent"
+                    if mode in ("soft_recurrent", "hidden_recurrent")
                     else None,
                     "latent_entropy_stopped": latent_metrics["entropy_stopped"]
                     if mode == "soft_recurrent"
@@ -830,7 +868,7 @@ class NeuraleseTUI(App):
             output.write(result["raw_output"], scroll_end=True)
         if selected:
             self.query_one("#benchmark-status", Label).update(
-                f"Viewing {case_id} · {len(selected)}/4 conditions"
+                f"Viewing {case_id} · {len(selected)}/{len(MODES)} conditions"
             )
 
 

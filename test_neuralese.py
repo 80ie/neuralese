@@ -1,6 +1,8 @@
 import math
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -14,13 +16,240 @@ from neuralese import (
     choose_token,
     distribution_stats,
     extract_answer,
+    hidden_recurrent_answer,
     load_benchmark_cases,
     normalize_answer,
     parse_args,
+    run_benchmark,
     select_benchmark_cases,
     score_answer,
     validate_cuda_environment,
 )
+
+
+class FakeTokenizer:
+    def apply_chat_template(
+        self, messages, tokenize, add_generation_prompt, enable_thinking, return_tensors
+    ):
+        return torch.tensor([[1, 2]])
+
+    def __call__(self, text, add_special_tokens, return_tensors):
+        if text == "Thinking Process:\n\n":
+            ids = [3, 4]
+        elif text == "\n</think>\n\n":
+            ids = [8, 9]
+        else:
+            raise AssertionError(f"unexpected tokenizer input: {text!r}")
+        return SimpleNamespace(input_ids=torch.tensor([ids]))
+
+    def decode(self, token_ids, **kwargs):
+        return "ANSWER: 42" if token_ids else ""
+
+
+class FakeOutputEmbeddings(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(100, 3))
+
+    def forward(self, hidden):
+        logits = torch.zeros(*hidden.shape[:-1], 100)
+        # Keep this a genuine rank-[batch, sequence, vocab] output.  The
+        # actual hidden recurrence only needs the projection's final position.
+        logits[..., 1] = 10.0
+        return logits
+
+
+class FakeTextModel:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def __call__(self, **kwargs):
+        self.owner.base_calls.append(kwargs)
+        self.owner._cache_number += 1
+        if "input_ids" in kwargs:
+            ids = kwargs["input_ids"]
+            # Every prompt position is distinct, making accidental selection
+            # of the first position observable.  The scaffold's final ID is 4.
+            values = ids.float() * 10 + torch.arange(ids.shape[1]).float()
+            last_value = values[:, -1]
+            full_hidden = values.unsqueeze(-1).expand(-1, -1, 3).clone()
+        else:
+            previous = kwargs["inputs_embeds"][:, -1, :].mean(dim=-1)
+            last_value = previous + 1
+            full_hidden = last_value[:, None, None].expand(-1, 1, 3).clone()
+        self.owner.last_full_hidden = full_hidden
+        self.owner.full_hidden_history.append(full_hidden)
+        return SimpleNamespace(
+            past_key_values=f"base-cache-{self.owner._cache_number}",
+            last_hidden_state=full_hidden,
+        )
+
+
+class FakeHiddenModel:
+    def __init__(self):
+        self.device = torch.device("cpu")
+        self.generation_config = SimpleNamespace(eos_token_id=99)
+        self.calls = []
+        self.base_calls = []
+        self._cache_number = 0
+        self.last_full_hidden = None
+        self.full_hidden_history = []
+        self.model = FakeTextModel(self)
+        self.output_embeddings = FakeOutputEmbeddings()
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        input_ids = kwargs["input_ids"]
+        logits = torch.zeros(1, input_ids.shape[1], 100)
+        if int(input_ids[0, -1]) == 9:  # visible anchor
+            logits[:, :, 1] = 10.0
+        else:  # token-sensitive visible decoding: terminate after one token
+            logits[:, :, 99] = 10.0
+        return SimpleNamespace(
+            past_key_values="visible-cache",
+            logits=logits,
+        )
+
+    def get_output_embeddings(self):
+        return self.output_embeddings
+
+
+class HiddenRecurrentTests(unittest.TestCase):
+    def test_recurrence_uses_final_hidden_states_and_forwards_cache(self):
+        model = FakeHiddenModel()
+        tokenizer = FakeTokenizer()
+        callbacks = []
+
+        answer, completed = hidden_recurrent_answer(
+            model,
+            tokenizer,
+            "question",
+            latent_steps=2,
+            max_new_tokens=1,
+            output_temperature=0.0,
+            output_top_p=1.0,
+            seed=0,
+            on_hidden_step=lambda index, rms: callbacks.append((index, rms)),
+        )
+
+        self.assertEqual(answer, "ANSWER: 42")
+        self.assertEqual(completed, 2)
+        recurrent_calls = [call for call in model.base_calls if "inputs_embeds" in call]
+        self.assertEqual(len(recurrent_calls), 2)
+        torch.testing.assert_close(
+            recurrent_calls[0]["inputs_embeds"], torch.full((1, 1, 3), 43.0)
+        )
+        torch.testing.assert_close(
+            recurrent_calls[1]["inputs_embeds"], torch.full((1, 1, 3), 44.0)
+        )
+        self.assertEqual(recurrent_calls[0]["past_key_values"], "base-cache-1")
+        self.assertEqual(recurrent_calls[1]["past_key_values"], "base-cache-2")
+        self.assertEqual(callbacks[0][0], 1)
+        self.assertAlmostEqual(callbacks[0][1], 44.0)
+        self.assertEqual(callbacks[1][0], 2)
+        self.assertAlmostEqual(callbacks[1][1], 45.0)
+        self.assertTrue(all(call["use_cache"] and call["return_dict"] for call in model.base_calls))
+        self.assertTrue(all("output_hidden_states" not in call for call in model.base_calls))
+        prompt_hidden = model.full_hidden_history[0]
+        self.assertLess(recurrent_calls[0]["inputs_embeds"].numel(), prompt_hidden.numel())
+        self.assertNotEqual(
+            prompt_hidden.untyped_storage().data_ptr(),
+            recurrent_calls[0]["inputs_embeds"].untyped_storage().data_ptr(),
+        )
+
+        # The anchor is a real visible token sequence after the latent cache,
+        # and visible decoding uses its logits rather than latent logits.
+        anchor = next(call for call in model.calls if "input_ids" in call)
+        self.assertEqual(anchor["input_ids"].tolist(), [[8, 9]])
+        self.assertEqual(anchor["past_key_values"], "base-cache-3")
+        self.assertEqual(model.calls[-1]["input_ids"].tolist(), [[1]])
+
+    def test_stop_and_zero_steps_still_anchor_and_decode(self):
+        model = FakeHiddenModel()
+        tokenizer = FakeTokenizer()
+        stop = lambda: True
+
+        answer, completed = hidden_recurrent_answer(
+            model,
+            tokenizer,
+            "question",
+            latent_steps=3,
+            max_new_tokens=1,
+            output_temperature=0.0,
+            output_top_p=1.0,
+            seed=0,
+            should_stop=stop,
+        )
+        self.assertEqual((answer, completed), ("", 0))
+        self.assertEqual(sum("inputs_embeds" in call for call in model.base_calls), 0)
+        self.assertTrue(any("past_key_values" in call for call in model.calls))
+
+        # A stop observed after one completed latent position prevents the
+        # next position, while still preserving the completed-step count.
+        model = FakeHiddenModel()
+        checks = 0
+
+        def stop_after_one():
+            nonlocal checks
+            checks += 1
+            return checks >= 2
+
+        answer, completed = hidden_recurrent_answer(
+            model, tokenizer, "question", latent_steps=3, max_new_tokens=1,
+            output_temperature=0.0, output_top_p=1.0, seed=0,
+            should_stop=stop_after_one,
+        )
+        self.assertEqual((answer, completed), ("", 1))
+        self.assertEqual(len(model.base_calls), 2)
+
+        model = FakeHiddenModel()
+        answer, completed = hidden_recurrent_answer(
+            model,
+            tokenizer,
+            "question",
+            latent_steps=0,
+            max_new_tokens=1,
+            output_temperature=0.0,
+            output_top_p=1.0,
+            seed=0,
+        )
+        self.assertEqual((answer, completed), ("ANSWER: 42", 0))
+        self.assertEqual(sum("inputs_embeds" in call for call in model.base_calls), 0)
+
+
+class BenchmarkTests(unittest.TestCase):
+    def test_run_benchmark_keeps_five_modes_in_order_after_execution_error(self):
+        args = parse_args(["--benchmark", "--soft-steps", "2"])
+        case = {
+            "id": "demo",
+            "category": "logic_constraints",
+            "difficulty": "calibration",
+            "prompt": "question",
+            "accepted_answers": ["42"],
+            "rationale": "test",
+        }
+
+        def soft(**kwargs):
+            return "ANSWER: 42", 0
+
+        def hard(**kwargs):
+            return "ANSWER: 42", 2
+
+        def hidden(**kwargs):
+            raise RuntimeError("hidden failed")
+
+        with patch("neuralese.soft_recurrent_answer", side_effect=soft), \
+             patch("neuralese.hard_argmax_answer", side_effect=hard), \
+             patch("neuralese.hidden_recurrent_answer", side_effect=hidden), \
+             patch("neuralese.ordinary_cot_answer", return_value="ANSWER: 42"):
+            results = run_benchmark(object(), object(), [case], args)
+
+        self.assertEqual(
+            [result["mode"] for result in results],
+            ["baseline", "hard_argmax", "soft_recurrent", "hidden_recurrent", "ordinary_cot"],
+        )
+        self.assertEqual(results[3]["status"], "execution_error: RuntimeError: hidden failed")
+        self.assertEqual(results[4]["raw_output"], "ANSWER: 42")
 
 
 class DistributionStatsTests(unittest.TestCase):
@@ -204,6 +433,19 @@ class CliTests(unittest.TestCase):
         self.assertFalse(score_answer("The answer is 1200.", ["1200"])["correct"])
         self.assertEqual(score_answer("ANSWER: 12", ["13"])["status"], "ok")
         self.assertEqual(score_answer("no marker", ["12"])["status"], "missing_answer_marker")
+
+    def test_logic_06_accepts_spaced_pairs_and_requires_answer_marker(self) -> None:
+        cases = load_benchmark_cases(Path(__file__).with_name("benchmark_cases.jsonl"))
+        logic_06 = next(case for case in cases if case["id"] == "logic_06")
+        accepted_answers = logic_06["accepted_answers"]
+
+        self.assertTrue(score_answer("ANSWER: P, Q", accepted_answers)["correct"])
+        self.assertTrue(score_answer("ANSWER: Q, P", accepted_answers)["correct"])
+        self.assertFalse(score_answer("ANSWER: P/R", accepted_answers)["correct"])
+        self.assertEqual(
+            score_answer("The answer is P, Q.", accepted_answers)["status"],
+            "missing_answer_marker",
+        )
 
     def test_benchmark_config_records_mode_and_decode_controls(self) -> None:
         args = parse_args(

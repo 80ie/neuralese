@@ -1,8 +1,9 @@
 # Neuralese
 
-Experimental soft-token recurrence with the local Qwen3.5 checkpoint. Each
-latent step turns the model's next-token distribution into a weighted average
-of input embeddings and feeds that vector back as the next sequence position.
+Experimental recurrence with the local Qwen3.5 checkpoint. Soft recurrence
+turns each next-token distribution into a weighted average of input embeddings;
+hidden recurrence feeds each latent position's final decoder hidden state back
+as the next sequence position.
 
 ## Setup
 
@@ -39,13 +40,15 @@ Benchmark JSONL result configs record both GPU limits.
 ```
 
 The Conversation tab keeps multi-turn history and supports soft recurrence,
-the no-latent baseline, hard argmax recurrence, and ordinary CoT. Text appears
-token by token; soft mode also shows temperature, effective support, retained
-mass, and top candidates for every latent step.
+hidden-state recurrence, the no-latent baseline, hard argmax recurrence, and
+ordinary CoT. Text appears token by token; soft mode shows temperature,
+effective support, retained mass, and top candidates for every latent step,
+while hidden mode reports hidden-state RMS.
 
-The Benchmark tab runs all four modes sequentially from one loaded checkpoint.
-Its case matrix updates live with extracted answers, and four output panes keep
-each mode's latest generation. The summary shows accuracy, change from
+The benchmark runs all five modes sequentially from one loaded checkpoint:
+baseline, hard argmax, soft recurrence, hidden recurrence, and ordinary CoT.
+The TUI case matrix updates live with extracted answers, and its summary shows
+accuracy, change from
 baseline, average latency, and output tokens per second. Its controls expose
 latent steps, adaptive versus fixed temperature, target support, top-k,
 temperature bounds, entropy stopping, and answer budget. Results are saved
@@ -101,15 +104,16 @@ diagnostics. Low retained mass emits a warning and entropy stopping remains a
 guard against broad mixtures.
 
 Use `--soft-steps 0` as the no-latent-step baseline. For a single-process
-comparison of four conditions, use:
+comparison of five conditions, use:
 
 ```bash
 .venv/bin/neuralese --compare --soft-steps 4 --max-new-tokens 256 \
   'If a bat and ball cost $1.10 total and the bat costs $1 more, what does the ball cost?'
 ```
 
-This prints labeled no-latent, hard-argmax, soft-recurrent, and ordinary
-visible-CoT outputs. Hard steps feed selected IDs through the cache; ordinary
+This prints labeled no-latent, hard-argmax, soft-recurrent, hidden-recurrent,
+and ordinary visible-CoT outputs. Hard steps feed selected IDs through the
+cache; hidden steps feed final decoder hidden states through the cache; ordinary
 CoT lets the model generate its normal thinking tokens. These are comparison
 outputs only: evaluate each condition against an answer key; comparison alone
 does not establish utility or accuracy.
@@ -119,7 +123,7 @@ does not establish utility or accuracy.
 The bundled `benchmark_cases.jsonl` contains 28 original cases across
 arithmetic/unit conversion, state tracking, logic constraints, and symbolic
 algorithms: 16 `calibration` cases and 12 longer-chain `challenge` cases. Each
-requests an explicit `ANSWER:` line. Run all four modes in one model-loading
+requests an explicit `ANSWER:` line. Run all five modes in one model-loading
 process and write JSONL results with:
 
 ```bash
@@ -136,8 +140,8 @@ filter by tier. A recommended challenge-only run is:
   --max-new-tokens 512 --results-file /tmp/neuralese-challenge.jsonl
 ```
 
-Results record the mode (`baseline`, `hard_argmax`,
-`soft_recurrent`, or `ordinary_cot`), exact configuration, raw output,
+Results record the mode (`baseline`, `hard_argmax`, `soft_recurrent`,
+`hidden_recurrent`, or `ordinary_cot`), exact configuration, raw output,
 normalized extracted answer, correctness, status, and latency. Baseline uses
 the same chat/scaffold setup with zero latent positions; recurrent modes add
 the requested latent positions, while ordinary CoT uses normal visible-token

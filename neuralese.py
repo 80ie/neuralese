@@ -221,6 +221,66 @@ def prime_thinking_context(
 
 
 @torch.inference_mode()
+def _forward_hidden_recurrence(
+    model,
+    *,
+    input_ids: torch.Tensor | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    past_key_values=None,
+):
+    """Run one hidden recurrence position through Qwen's text model only.
+
+    Calling the causal-LM wrapper with ``output_hidden_states=True`` retains a
+    hidden-state tensor for every decoder layer and every prompt position.
+    That is particularly costly with Accelerate's sequential placement.  The
+    Qwen 3.5 text model already returns its final (post-normalization) hidden
+    state, so use it directly and project only its final position through the
+    output head.  Cache objects are deliberately treated as opaque values.
+    """
+    if (input_ids is None) == (inputs_embeds is None):
+        raise ValueError("provide exactly one of input_ids or inputs_embeds")
+
+    kwargs = {
+        "use_cache": True,
+        "return_dict": True,
+        "past_key_values": past_key_values,
+    }
+    if input_ids is not None:
+        kwargs["input_ids"] = input_ids
+    else:
+        kwargs["inputs_embeds"] = inputs_embeds
+    outputs = model.model(**kwargs)
+    # Clone the one position so it does not retain the base model's full
+    # prompt/sequence storage (and so the next step owns its compact tensor).
+    hidden = outputs.last_hidden_state[:, -1:, :].clone()
+    output_embeddings = model.get_output_embeddings()
+    if output_embeddings is None:
+        output_embeddings = model.lm_head
+    logits = output_embeddings(hidden)[:, -1, :]
+    return outputs.past_key_values, logits, hidden
+
+
+@torch.inference_mode()
+def prime_thinking_context_with_hidden(
+    model,
+    tokenizer,
+    prompt: str,
+    use_thinking_scaffold: bool,
+    messages: Sequence[dict] | None = None,
+):
+    """Prime the thinking context and retain its final decoder hidden state."""
+    if messages is None:
+        input_ids = chat_input_ids(tokenizer, prompt, use_thinking_scaffold)
+    else:
+        input_ids = chat_messages_input_ids(tokenizer, messages, use_thinking_scaffold)
+    input_ids = input_ids.to(model.device)
+    return _forward_hidden_recurrence(
+        model,
+        input_ids=input_ids,
+    )
+
+
+@torch.inference_mode()
 def append_visible_anchor(model, tokenizer, cache, logits):
     anchor_ids = tokenizer(
         THINK_END,
@@ -454,6 +514,60 @@ def hard_argmax_answer(
 
 
 @torch.inference_mode()
+def hidden_recurrent_answer(
+    model,
+    tokenizer,
+    prompt: str,
+    latent_steps: int,
+    max_new_tokens: int,
+    output_temperature: float,
+    output_top_p: float,
+    seed: int,
+    use_thinking_scaffold: bool = True,
+    messages: Sequence[dict] | None = None,
+    on_text: Callable[[str], None] | None = None,
+    on_hidden_step: Callable[[int, float], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> tuple[str, int]:
+    """Recur by feeding each latent position's final hidden state back in."""
+    cache, logits, hidden = prime_thinking_context_with_hidden(
+        model, tokenizer, prompt, use_thinking_scaffold, messages=messages
+    )
+    completed_steps = 0
+    for step_index in range(latent_steps):
+        if should_stop is not None and should_stop():
+            break
+        # A sequentially sharded model may place the final decoder output on a
+        # different device from its input interface.  Moving the tensor does
+        # not change its dtype or values; cache objects are passed untouched.
+        inputs_embeds = hidden.to(model.device)
+        cache, logits, hidden = _forward_hidden_recurrence(
+            model,
+            inputs_embeds=inputs_embeds,
+            past_key_values=cache,
+        )
+        completed_steps += 1
+        rms = hidden.float().square().mean().sqrt().item()
+        if on_hidden_step is not None:
+            on_hidden_step(completed_steps, rms)
+
+    cache, logits = append_visible_anchor(model, tokenizer, cache, logits)
+    answer = decode_visible_answer(
+        model,
+        tokenizer,
+        cache,
+        logits,
+        max_new_tokens,
+        output_temperature,
+        output_top_p,
+        seed,
+        on_text=on_text,
+        should_stop=should_stop,
+    )
+    return answer, completed_steps
+
+
+@torch.inference_mode()
 def ordinary_cot_answer(
     model,
     tokenizer,
@@ -629,7 +743,7 @@ def run_benchmark(
     cases: Sequence[dict],
     args: argparse.Namespace,
 ) -> list[dict]:
-    """Run all four conditions while reusing the one loaded model."""
+    """Run all five conditions while reusing the one loaded model."""
     entropy_stop = args.entropy_stop if args.entropy_stop >= 0 else None
     common = dict(
         model=model,
@@ -684,6 +798,15 @@ def run_benchmark(
                     max_soft_temperature=args.soft_temperature_max,
                     soft_top_k_warning_mass=args.soft_top_k_warning_mass,
                     show_trace=False,
+                )[0],
+            ),
+            (
+                "hidden_recurrent",
+                lambda: hidden_recurrent_answer(
+                    **common,
+                    prompt=prompt,
+                    latent_steps=args.soft_steps,
+                    use_thinking_scaffold=args.use_thinking_scaffold,
                 )[0],
             ),
             (
@@ -765,7 +888,10 @@ def validate_cuda_environment(cuda_device_count: int | None = None) -> None:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run probability-weighted soft tokens through Qwen before decoding an answer."
+        description=(
+            "Run probability-weighted soft tokens or recurrent hidden states "
+            "through Qwen before decoding an answer."
+        )
     )
     parser.add_argument("prompt", nargs="?")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
@@ -782,7 +908,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--benchmark",
         action="store_true",
-        help="Run the bundled four-mode benchmark instead of one prompt.",
+        help="Run the bundled five-mode benchmark instead of one prompt.",
     )
     parser.add_argument("--benchmark-file", type=Path, default=DEFAULT_BENCHMARK_FILE)
     parser.add_argument("--results-file", type=Path, default=DEFAULT_RESULTS_FILE)
@@ -840,13 +966,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--disable-thinking-scaffold",
         dest="use_thinking_scaffold",
         action="store_false",
-        help="Begin soft/hard recurrence immediately after the template's <think>\\n.",
+        help="Begin soft/hard/hidden recurrence immediately after the template's <think>\\n.",
     )
     parser.set_defaults(use_thinking_scaffold=True)
     parser.add_argument(
         "--compare",
         action="store_true",
-        help="Print baseline, hard-argmax, soft-recurrent, and ordinary-CoT outputs.",
+        help="Print baseline, hard-argmax, soft-recurrent, hidden-recurrent, and ordinary-CoT outputs.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument(
@@ -971,10 +1097,16 @@ def main() -> None:
             soft_top_k_warning_mass=args.soft_top_k_warning_mass,
             show_trace=True,
         )
+        hidden, hidden_completed = hidden_recurrent_answer(
+            **common,
+            latent_steps=args.soft_steps,
+            use_thinking_scaffold=args.use_thinking_scaffold,
+        )
         cot = ordinary_cot_answer(**common)
         print(f"\n=== No latent steps (baseline) ===\n{baseline}")
         print(f"\n=== Hard argmax steps ({hard_steps}) ===\n{hard}")
         print(f"\n=== Soft recurrent steps ({soft_completed}) ===\n{soft}")
+        print(f"\n=== Hidden recurrent steps ({hidden_completed}) ===\n{hidden}")
         print(f"\n=== Ordinary visible CoT ===\n{cot}")
     else:
         answer, completed_steps = soft_recurrent_answer(
