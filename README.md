@@ -49,12 +49,29 @@ while hidden and interleaved modes report hidden-state RMS.
 The benchmark runs all six modes sequentially from one loaded checkpoint:
 baseline, hard argmax, soft recurrence, hidden recurrence, ordinary CoT, and
 interleaved recurrence.
-The TUI case matrix updates live with extracted answers, and its summary shows
-accuracy, change from
-baseline, average latency, and output tokens per second. Its controls expose
-latent steps, adaptive versus fixed temperature, target support, top-k,
-temperature bounds, entropy stopping, and answer budget. Results are saved
-after every condition to `benchmark_tui_results.jsonl` by default.
+The benchmark dashboard has a compact case matrix and a six-mode summary of
+accuracy, change from baseline, average latency, and output tokens per second.
+The matrix distinguishes pass (`✓`), fail (`✗`), running (`▶`), pending (`·`),
+stopped (`■`), and execution error (`!`). Case IDs stay pinned when scrolling.
+
+Select a case with a click or Enter to inspect its expected answer and compare
+the baseline output with another mode. The two output panes show extracted
+answers and per-result metrics, wrap long lines, and can be expanded. **Full
+prompt** opens the case's prompt and accepted answers. Selecting a case or
+changing the comparison mode turns **Follow live** off, so background generation
+does not replace the result you're reading. Turn it back on to follow the active
+case and mode. Scrolling up in an output pauses tail-following; return to the
+bottom to resume it.
+
+**Settings** groups dataset and token budgets, latent steps, soft recurrence,
+and interleaved recurrence. Only the relevant adaptive or fixed-temperature
+fields are shown, and entropy stopping has an explicit on/off switch. Settings
+are held fixed during a run. Narrow terminals switch between Cases/Summary and
+Baseline/Comparison; short terminals provide separate Cases, Summary, and Output
+views to preserve reading space. Run and Stop remain visible.
+
+Results are saved after every condition to `benchmark_tui_results.jsonl` by
+default.
 
 Support is `exp(entropy)` for the softmax distribution: the number of equally
 likely candidates that would have the same uncertainty. Support 1 is
@@ -65,9 +82,10 @@ truncation.
 
 Latent duration is controlled by **Steps**, not support. Increase Steps to 32
 or 64 for a longer recurrent pass. A soft run may finish early when normalized
-entropy reaches Entropy stop; use a negative value to disable that guard during
-experiments. The live output title reports latent progress, selected
-temperature, effective support, and an explicit entropy-stop event. JSONL also
+entropy reaches the entropy threshold; disable **Entropy stopping** in TUI
+Settings (or use a negative CLI value) to turn off that guard. The live output
+metrics report latent progress, selected temperature, effective support, and an
+explicit entropy-stop event. JSONL also
 records completed latent steps and time to first visible token.
 
 Use `Esc` to stop after the current token, `Ctrl+L` to clear conversation
